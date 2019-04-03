@@ -170,15 +170,29 @@ class RedisProtocol(asyncio.Protocol):
     # def __repr__(self):
     #     return '<RedisProtocol >'.format(self.transport)
 
-    def lock(self, lock_name, timeout):
-        print("lock", lock_name, timeout)
+    def lock(self, lock_name, wait_timeout, auto_release_timeout=0, release_on_lost_conn=1):
+        """
+
+        :param lock_name: name of the lock
+        :param wait_timeout: if can't acquire lock under wait_timeout seconds, we'll return an error
+        :param auto_release_timeout: in case someone forgets to release the lock, we'll wait forever,
+                if you set auto_release_timeout, we release the lock after some time
+        :param release_on_lost_conn: if the process holding the lock crashes, should we release the lock ?
+                default: 1
+                it will release the lock after 1 sec. after the connection gets lost
+        :return:
+        """
+        print("lock", lock_name, wait_timeout, auto_release_timeout, release_on_lost_conn)
         lock: Lock = self.server.locks.get(lock_name)
         if not lock:
-            self.server.locks[lock_name]: Lock = Lock(name=lock_name, ttl=timeout, owner=self)
+            lock = Lock(name=lock_name, ttl=wait_timeout, owner=self)
+            lock.auto_release_timeout = int(auto_release_timeout)
+            lock.release_on_lost_conn = int(release_on_lost_conn)
+            self.server.locks[lock_name]: Lock = lock
             return redis_encode(self.server.locks[lock_name].id)
         else:
             print("adding node to lock")
-            lock.add_waiting_node(self, timeout)
+            lock.add_waiting_node(self, wait_timeout)
 
     def release(self, lock_name):
         print("releasing", lock_name)
