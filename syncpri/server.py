@@ -14,7 +14,7 @@ from typing import Any
 import ujson as json
 import hiredis
 import uvloop
-from six import b
+from six import b, wraps
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
@@ -45,6 +45,10 @@ def to_b(arg) -> bytes:
 
 def redis_encode(*args):
     "Pack a series of arguments into a value Redis command"
+    for arg in args:
+        if isinstance(arg, list):
+            return redis_encode(*arg)
+
     result = []
     result.append(b"*")
     result.append(to_b(len(args)))
@@ -59,9 +63,6 @@ def redis_encode(*args):
             result.append(to_b(arg))
             result.append(DELIMITER)
     ret = b"".join(result)
-    print("-----")
-    print(ret)
-    print("//---")
     return ret
 
 
@@ -83,6 +84,12 @@ class Server:
         while True:
             await asyncio.sleep(30)
 
+class Error:
+    """
+    this is to wrap redis error replies
+    """
+    def __init__(self, msg):
+        self.msg = msg
 
 class LockNode:
     def __init__(self, conn, identifier, timeout, loop=None):
@@ -153,6 +160,24 @@ class Lock:
             except Exception as e:
                 logger.exception('exception on moving to next node')
 
+
+class Wait:
+    def __init__(self, identifier):
+        self.identifier = identifier
+
+
+def redis_encoded(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        ret = fn(*args, **kwargs)
+        if isinstance(ret, Error):
+            return b'-ERR %s\r\n' % to_b(ret.msg)
+        if isinstance(ret, Wait):
+            return
+        return redis_encode(ret)
+    return wrapper
+
+
 class RedisProtocol(asyncio.Protocol):
 
     def __init__(self, loop: asyncio.AbstractEventLoop, server: Server):
@@ -167,6 +192,7 @@ class RedisProtocol(asyncio.Protocol):
     # def __repr__(self):
     #     return '<RedisProtocol >'.format(self.transport)
 
+    @redis_encoded
     def CMD_lock(self, lock_name, wait_timeout, auto_release_timeout=0, release_on_lost_conn=1):
         """
 
@@ -187,11 +213,13 @@ class RedisProtocol(asyncio.Protocol):
             lock.auto_release_timeout = int(auto_release_timeout)
             lock.release_on_lost_conn = int(release_on_lost_conn)
             self.server.locks[lock_name]: Lock = lock
-            return redis_encode(self.server.locks[lock_name].id)
+            return self.server.locks[lock_name].id
         else:
             logger.debug("adding node to lock")
             lock.add_waiting_node(self, wait_timeout)
+            return Wait(self.identifier)
 
+    @redis_encoded
     def CMD_release(self, lock_name, identifier):
         logger.debug("releasing %s %s", lock_name, identifier)
         lock: Lock = self.server.locks.get(lock_name)
@@ -199,48 +227,48 @@ class RedisProtocol(asyncio.Protocol):
             logger.debug("moving next %s", lock_name)
             if not lock.move_next():
                 del self.server.locks[lock_name]
-            return redis_encode(lock.id)
+            return lock.id
         else:
-            return b'-ERR lock does not exist (or not owner)'
+            return Error('lock does not exist (or not owner)')
 
     def identify(self):
         return self.identifier or ':'.join([str(i) for i in self.transport.get_extra_info('peername')])
 
+    @redis_encoded
     def CMD_node_list(self, lock_name):
         # TODO:
         lock: Lock = self.server.locks.get(lock_name)
         if not lock:
-            return b'-ERR lock does not exist'
+            return Error('lock does not exist')
         out = json.dumps({
             'owner': lock.owner.identify(),
             'waiting': [ln.conn.identify() for ln in lock.waiting_nodes]
         })
-        print(out)
-        return redis_encode(out)
+        return out
 
     def CMD_join(self, identifier):
         self.identifier = identifier
         return OK_RESPONSE
 
+    @redis_encoded
     def CMD_subscribe(self, chan):
-        print("subscribed")
         subscribers[chan].add(self)
-        return redis_encode(
+        return [
             'subscribe',
             chan,
             1
-        )
+        ]
 
     def CMD_unsubscribe(self, chan):
         subscribers[chan].add(self)
-        return b"+OK\r\n"
+        return OK_RESPONSE
 
     def CMD_publish(self, chan, message):
         print("command")
         for conn in subscribers[chan]:
             # print(redis_encode(chan, message))
             conn.transport.write(redis_encode('message', chan, message))
-        return b"+OK\r\n"
+        return OK_RESPONSE
 
     def connection_made(self, transport: asyncio.transports.Transport):
         self.transport = transport
@@ -272,84 +300,83 @@ class RedisProtocol(asyncio.Protocol):
             self.transport.writelines(self.response)
             self.response.clear()
 
-    def command(self):
-        # Far from being a complete implementation of the `COMMAND` command of
-        # Redis, yet sufficient for us to start using redis-cli.
-        return b"+OK\r\n"
+    def CMD_command(self):
+        # TODO:?
+        return OK_RESPONSE
 
-    def CMD_set(self, *args) -> bytes:
-        # Defaults
-        key = args[0]
-        value = args[1]
-        expires_at = None
-        cond = b""
-
-        largs = len(args)
-        if largs == 3:
-            # SET key value [NX|XX]
-            cond = args[2]
-        elif largs >= 4:
-            # SET key value [EX seconds | PX milliseconds] [NX|XX]
-            try:
-                if args[2] == b"EX":
-                    duration = int(args[3])
-                elif args[2] == b"PX":
-                    duration = int(args[3]) / 1000
-                else:
-                    return b"-ERR syntax error\r\n"
-            except ValueError:
-                return b"-value is not an integer or out of range\r\n"
-
-            if duration <= 0:
-                return b"-ERR invalid expire time in set\r\n"
-
-            expires_at = time.monotonic() + duration
-
-            if largs == 5:
-                cond = args[4]
-
-        if cond == b"":
-            pass
-        elif cond == b"NX":
-            if key in self.dictionary:
-                return b"$-1\r\n"
-        elif cond == b"XX":
-            if key not in self.dictionary:
-                return b"$-1\r\n"
-        else:
-            return b"-ERR syntax error\r\n"
-
-        if expires_at:
-            expiration[key] = expires_at
-
-        self.dictionary[key] = value
-        return b"+OK\r\n"
-
-    def CMD_get(self, key: bytes) -> bytes:
-        if key not in self.dictionary:
-            return b"$-1\r\n"
-
-        if key in expiration and expiration[key] < time.monotonic():
-            del self.dictionary[key]
-            del expiration[key]
-            return b"$-1\r\n"
-        else:
-            value = self.dictionary[key]
-            return b"$%d\r\n%s\r\n" % (len(value), value)
+    # def CMD_set(self, *args) -> Any[bytes, Error]:
+    #     # Defaults
+    #     key = args[0]
+    #     value = args[1]
+    #     expires_at = None
+    #     cond = b""
+    #
+    #     largs = len(args)
+    #     if largs == 3:
+    #         # SET key value [NX|XX]
+    #         cond = args[2]
+    #     elif largs >= 4:
+    #         # SET key value [EX seconds | PX milliseconds] [NX|XX]
+    #         try:
+    #             if args[2] == b"EX":
+    #                 duration = int(args[3])
+    #             elif args[2] == b"PX":
+    #                 duration = int(args[3]) / 1000
+    #             else:
+    #                 return Error("syntax error")
+    #         except ValueError:
+    #             return Error("value is not an integer or out of range")
+    #
+    #         if duration <= 0:
+    #             return Error("invalid expire time in set")
+    #
+    #         expires_at = time.monotonic() + duration
+    #
+    #         if largs == 5:
+    #             cond = args[4]
+    #
+    #     if cond == b"":
+    #         pass
+    #     elif cond == b"NX":
+    #         if key in self.dictionary:
+    #             return b"$-1\r\n"
+    #     elif cond == b"XX":
+    #         if key not in self.dictionary:
+    #             return b"$-1\r\n"
+    #     else:
+    #         return b"-ERR syntax error\r\n"
+    #
+    #     if expires_at:
+    #         expiration[key] = expires_at
+    #
+    #     self.dictionary[key] = value
+    #     return b"+OK\r\n"
+    #
+    # def CMD_get(self, key: bytes) -> bytes:
+    #     if key not in self.dictionary:
+    #         return b"$-1\r\n"
+    #
+    #     if key in expiration and expiration[key] < time.monotonic():
+    #         del self.dictionary[key]
+    #         del expiration[key]
+    #         return b"$-1\r\n"
+    #     else:
+    #         value = self.dictionary[key]
+    #         return b"$%d\r\n%s\r\n" % (len(value), value)
 
     def CMD_ping(self, message=b"PONG"):
-        return b"$%d\r\n%s\r\n" % (len(message), message)
+        return b"+PONG\r\n"
 
-    def CMD_incr(self, key):
-        value = self.dictionary.get(key, 0)
-        if type(value) is str:
-            try:
-                value = int(value)
-            except ValueError:
-                return b"-value is not an integer or out of range\r\n"
-        value += 1
-        self.dictionary[key] = str(value)
-        return b":%d\r\n" % (value,)
+    # def CMD_incr(self, key):
+    #     value = self.dictionary.get(key, 0)
+    #     if type(value) is str:
+    #         try:
+    #             value = int(value)
+    #         except ValueError:
+    #             return b"-value is not an integer or out of range\r\n"
+    #     value += 1
+    #     self.dictionary[key] = str(value)
+    #     return b":%d\r\n" % (value,)
 
     def CMD_del(self, key):
         # TODO: missing arguments
@@ -388,29 +415,30 @@ class RedisProtocol(asyncio.Protocol):
         value = deque.pop()
         return b"$%d\r\n%s\r\n" % (len(value), value)
 
-    def CMD_sadd(self, key, *members):
-        set_ = self.dictionary.get(key, set())
-        prev_size = len(set_)
-        for member in members:
-            set_.add(member)
-        self.dictionary[key] = set_
-        return b":%d\r\n" % (len(set_) - prev_size,)
+    # def CMD_sadd(self, key, *members):
+    #     set_ = self.dictionary.get(key, set())
+    #     prev_size = len(set_)
+    #     for member in members:
+    #         set_.add(member)
+    #     self.dictionary[key] = set_
+    #     return b":%d\r\n" % (len(set_) - prev_size,)
 
-    def CMD_hset(self, key, field, value):
-        hash_ = self.dictionary.get(key, {})
-        ret = int(field in hash_)
-        hash_[field] = value
-        self.dictionary[key] = hash_
-        return b":%d\r\n" % (ret,)
+    # def CMD_hset(self, key, field, value):
+    #     hash_ = self.dictionary.get(key, {})
+    #     ret = int(field in hash_)
+    #     hash_[field] = value
+    #     self.dictionary[key] = hash_
+    #     return b":%d\r\n" % (ret,)
 
-    def CMD_spop(self, key):  # TODO add `count`
-        try:
-            set_ = self.dictionary[key]  # type: set
-            elem = set_.pop()
-        except KeyError:
-            return b"$-1\r\n"
-        return b"$%d\r\n%s\r\n" % (len(elem), elem)
+    # def CMD_spop(self, key):  # TODO add `count`
+    #     try:
+    #         set_ = self.dictionary[key]  # type: set
+    #         elem = set_.pop()
+    #     except KeyError:
+    #         return b"$-1\r\n"
+    #     return b"$%d\r\n%s\r\n" % (len(elem), elem)
 
+    @redis_encoded
     def CMD_lrange(self, key, start, stop):
         start = int(start)
         stop = int(stop)
@@ -418,15 +446,14 @@ class RedisProtocol(asyncio.Protocol):
             deque = self.dictionary[key]  # type: collections.deque
         except KeyError:
             return b"$-1\r\n"
-        l = itertools.islice(deque, start, stop)
-        return redis_encode(*list(l))
+        return list(itertools.islice(deque, start, stop))
 
-    def CMD_mset(self, *args):
-        for i in range(0, len(args), 2):
-            key = args[i]
-            value = args[i + 1]
-            self.dictionary[key] = value
-        return b"+OK\r\n"
+    # def CMD_mset(self, *args):
+    #     for i in range(0, len(args), 2):
+    #         key = args[i]
+    #         value = args[i + 1]
+    #         self.dictionary[key] = value
+    #     return b"+OK\r\n"
 
 
 @click.command()
