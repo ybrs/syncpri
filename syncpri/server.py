@@ -117,12 +117,13 @@ class LockNode:
 
 
 class Lock:
-    def __init__(self, name, owner, ttl):
+    def __init__(self, name, owner, ttl, release_on_lost_conn=None):
         self.name = name
         self.owner = owner
         self.waiting_nodes = []
         self.id = str(uuid.uuid4())
         self.ttl = ttl
+        self.release_on_lost_conn = release_on_lost_conn
 
     def add_waiting_node(self, conn, timeout:int):
         """
@@ -137,6 +138,12 @@ class Lock:
         ln.set_timeout(int(timeout))
         self.waiting_nodes.append(ln)
         return ln
+
+    def notify_eof(self, conn):
+        if not self.release_on_lost_conn:
+            return
+        if self.owner == conn:
+            self.move_next()
 
     def _move_next(self):
         logger.debug("moving next %s", self.waiting_nodes)
@@ -188,6 +195,7 @@ class RedisProtocol(asyncio.Protocol):
         self.server = server
         self.transport = None  # type: asyncio.transports.Transport
         self.identifier = None
+        self.interests = set()
 
     # def __repr__(self):
     #     return '<RedisProtocol >'.format(self.transport)
@@ -199,7 +207,7 @@ class RedisProtocol(asyncio.Protocol):
         :param lock_name: name of the lock
         :param wait_timeout: if can't acquire lock under wait_timeout seconds, we'll return an error
         :param auto_release_timeout: in case someone forgets to release the lock, we'll wait forever,
-                if you set auto_release_timeout, we release the lock after some time
+                if you set auto_release_timeout, we release the lock after some time (#TODO)
         :param release_on_lost_conn: if the process holding the lock crashes, should we release the lock ?
                 default: 1
                 it will release the lock after 1 sec. after the connection gets lost
@@ -213,10 +221,12 @@ class RedisProtocol(asyncio.Protocol):
             lock.auto_release_timeout = int(auto_release_timeout)
             lock.release_on_lost_conn = int(release_on_lost_conn)
             self.server.locks[lock_name]: Lock = lock
+            self.interests.add(lock)
             return self.server.locks[lock_name].id
         else:
             logger.debug("adding node to lock")
             lock.add_waiting_node(self, wait_timeout)
+            self.interests.add(lock)
             return Wait(self.identifier)
 
     @redis_encoded
@@ -275,6 +285,9 @@ class RedisProtocol(asyncio.Protocol):
 
     def eof_received(self):
         print("connection end")
+        for lock in self.interests:
+            lock.notify_eof(self)
+
         for k, v in subscribers.items():
             if self in v:
                 v.remove(self)
