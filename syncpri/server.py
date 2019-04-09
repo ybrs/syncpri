@@ -15,6 +15,10 @@ import ujson as json
 import hiredis
 import uvloop
 from six import b
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 expiration = collections.defaultdict(lambda: float("inf"))  # type: Dict[bytes, float]
 dictionary = {}  # type: Dict[bytes, Any]
@@ -55,7 +59,9 @@ def redis_encode(*args):
             result.append(to_b(arg))
             result.append(DELIMITER)
     ret = b"".join(result)
+    print("-----")
     print(ret)
+    print("//---")
     return ret
 
 
@@ -75,17 +81,16 @@ class Server:
 
     async def heartbeat(self):
         while True:
-            print('periodic')
             await asyncio.sleep(30)
-            print("p2")
 
 
 class LockNode:
-    def __init__(self, conn, loop=None):
+    def __init__(self, conn, identifier, timeout, loop=None):
         self.conn: RedisProtocol = conn
         self.callback_timer = None
         self.loop = loop or asyncio.get_event_loop()
         self.timeout = None
+        self.identifier = identifier
 
     def send_wait_timeout_error(self):
         # TODO: remove from waiting nodes now !
@@ -99,6 +104,10 @@ class LockNode:
     def remove_ttl_callback(self):
         if self.callback_timer:
             self.callback_timer.cancel()
+
+    def __repr__(self):
+        return '<LockNode {} {}>'.format(self.identifier, self.timeout)
+
 
 class Lock:
     def __init__(self, name, owner, ttl):
@@ -117,20 +126,23 @@ class Lock:
         :param ttl:
         :return:
         """
-        ln = LockNode(conn)
+        ln = LockNode(conn, conn.identifier, timeout)
         ln.set_timeout(int(timeout))
         self.waiting_nodes.append(ln)
         return ln
 
     def move_next(self):
-        print("moving next", self.waiting_nodes)
+        logger.debug("moving next %s", self.waiting_nodes)
         if not self.waiting_nodes:
             return
         ln: LockNode = self.waiting_nodes.pop(0)
         ln.remove_ttl_callback()
-        print("next node ", ln)
+        logger.debug("next node %s", ln)
+        # NOTE: we change the lock id here, this id is nothing but
+        # to identify the client
+        self.id = str(uuid.uuid4())
         self.owner = ln.conn
-        print("send foo")
+        logger.debug("send foo %s", self.id)
         ln.conn.transport.write(redis_encode(self.id))
         return ln
 
@@ -144,33 +156,12 @@ class RedisProtocol(asyncio.Protocol):
         self.parser = hiredis.Reader()
         self.server = server
         self.transport = None  # type: asyncio.transports.Transport
-        self.commands = {
-            b"COMMAND": self.command,
-            b"SET": self.set,
-            b"GET": self.get,
-            b"PING": self.ping,
-            b"INCR": self.incr,
-            b"LPUSH": self.lpush,
-            b"RPUSH": self.rpush,
-            b"LPOP": self.lpop,
-            b"RPOP": self.rpop,
-            b"SADD": self.sadd,
-            b"HSET": self.hset,
-            b"SPOP": self.spop,
-            b"LRANGE": self.lrange,
-            b"MSET": self.mset,
-            b"SUBSCRIBE": self.subscribe,
-            b'PUBLISH': self.publish,
-            b'JOIN': self.join,
-            b'NODELIST': self.node_list,
-            b'LOCK': self.lock,
-            b'RELEASE': self.release
-        }
+        self.identifier = None
 
     # def __repr__(self):
     #     return '<RedisProtocol >'.format(self.transport)
 
-    def lock(self, lock_name, wait_timeout, auto_release_timeout=0, release_on_lost_conn=1):
+    def CMD_lock(self, lock_name, wait_timeout, auto_release_timeout=0, release_on_lost_conn=1):
         """
 
         :param lock_name: name of the lock
@@ -182,7 +173,8 @@ class RedisProtocol(asyncio.Protocol):
                 it will release the lock after 1 sec. after the connection gets lost
         :return:
         """
-        print("lock", lock_name, wait_timeout, auto_release_timeout, release_on_lost_conn)
+        logger.debug("lock %s %s %s %s %s", self, lock_name, wait_timeout,
+                     auto_release_timeout, release_on_lost_conn)
         lock: Lock = self.server.locks.get(lock_name)
         if not lock:
             lock = Lock(name=lock_name, ttl=wait_timeout, owner=self)
@@ -191,28 +183,29 @@ class RedisProtocol(asyncio.Protocol):
             self.server.locks[lock_name]: Lock = lock
             return redis_encode(self.server.locks[lock_name].id)
         else:
-            print("adding node to lock")
+            logger.debug("adding node to lock")
             lock.add_waiting_node(self, wait_timeout)
 
-    def release(self, lock_name):
-        print("releasing", lock_name)
+    def CMD_release(self, lock_name, identifier):
+        logger.debug("releasing %s %s", lock_name, identifier)
         lock: Lock = self.server.locks.get(lock_name)
-        print("lock - ", lock, lock.owner, self)
-        if lock and lock.owner == self:
-            print("moving next")
+        if lock and lock.owner == self and identifier.decode() == str(lock.id):
+            logger.debug("moving next %s", lock_name)
             if not lock.move_next():
                 del self.server.locks[lock_name]
-            return OK_RESPONSE
+            return redis_encode(lock.id)
+        else:
+            return b'-ERR lock doesnt exists (or not owner)'
 
-    def node_list(self):
+    def CMD_node_list(self):
         # TODO:
         pass
 
-    def join(self, identifier, ip, port):
-        # TODO:
-        pass
+    def CMD_join(self, identifier):
+        self.identifier = identifier
+        return OK_RESPONSE
 
-    def subscribe(self, chan):
+    def CMD_subscribe(self, chan):
         print("subscribed")
         subscribers[chan].add(self)
         return redis_encode(
@@ -221,11 +214,11 @@ class RedisProtocol(asyncio.Protocol):
             1
         )
 
-    def unsubscribe(self, chan):
+    def CMD_unsubscribe(self, chan):
         subscribers[chan].add(self)
         return b"+OK\r\n"
 
-    def publish(self, chan, message):
+    def CMD_publish(self, chan, message):
         print("command")
         for conn in subscribers[chan]:
             # print(redis_encode(chan, message))
@@ -249,12 +242,16 @@ class RedisProtocol(asyncio.Protocol):
             if req is False:
                 break
             else:
-                fn = self.commands[req[0].upper()]
+                fn = getattr(self, 'CMD_%s' % req[0].decode().lower(), None)
+                if not fn:
+                    self.transport.writelines([to_b('-ERR unknown command {}\r\n'.format('CMD_%s' % req[0].lower()))])
+                    self.response.clear()
+                    return
+
                 resp = fn(*req[1:])
                 if resp:
                     self.response.append(resp)
         if self.response:
-            print("--->", self.response)
             self.transport.writelines(self.response)
             self.response.clear()
 
@@ -263,7 +260,7 @@ class RedisProtocol(asyncio.Protocol):
         # Redis, yet sufficient for us to start using redis-cli.
         return b"+OK\r\n"
 
-    def set(self, *args) -> bytes:
+    def CMD_set(self, *args) -> bytes:
         # Defaults
         key = args[0]
         value = args[1]
@@ -311,7 +308,7 @@ class RedisProtocol(asyncio.Protocol):
         self.dictionary[key] = value
         return b"+OK\r\n"
 
-    def get(self, key: bytes) -> bytes:
+    def CMD_get(self, key: bytes) -> bytes:
         if key not in self.dictionary:
             return b"$-1\r\n"
 
@@ -323,11 +320,10 @@ class RedisProtocol(asyncio.Protocol):
             value = self.dictionary[key]
             return b"$%d\r\n%s\r\n" % (len(value), value)
 
-    def ping(self, message=b"PONG"):
-        print("PING", self.transport)
+    def CMD_ping(self, message=b"PONG"):
         return b"$%d\r\n%s\r\n" % (len(message), message)
 
-    def incr(self, key):
+    def CMD_incr(self, key):
         value = self.dictionary.get(key, 0)
         if type(value) is str:
             try:
@@ -338,19 +334,28 @@ class RedisProtocol(asyncio.Protocol):
         self.dictionary[key] = str(value)
         return b":%d\r\n" % (value,)
 
-    def lpush(self, key, *values):
+    def CMD_del(self, key):
+        # TODO: missing arguments
+        try:
+            del self.dictionary[key]
+            return b":%d\r\n" % (1,)
+        except KeyError as e:
+            return b":%d\r\n" % (0,)
+
+    def CMD_lpush(self, key, *values):
         deque = self.dictionary.get(key, collections.deque())
         deque.extendleft(values)
         self.dictionary[key] = deque
         return b":%d\r\n" % (len(deque),)
 
-    def rpush(self, key, *values):
+    def CMD_rpush(self, key, *values):
+        print("pushing - ", key, values)
         deque = self.dictionary.get(key, collections.deque())
         deque.extend(values)
         self.dictionary[key] = deque
         return b":%d\r\n" % (len(deque),)
 
-    def lpop(self, key):
+    def CMD_lpop(self, key):
         try:
             deque = self.dictionary[key]  # type: collections.deque
         except KeyError:
@@ -358,7 +363,7 @@ class RedisProtocol(asyncio.Protocol):
         value = deque.popleft()
         return b"$%d\r\n%s\r\n" % (len(value), value)
 
-    def rpop(self, key):
+    def CMD_rpop(self, key):
         try:
             deque = self.dictionary[key]  # type: collections.deque
         except KeyError:
@@ -366,7 +371,7 @@ class RedisProtocol(asyncio.Protocol):
         value = deque.pop()
         return b"$%d\r\n%s\r\n" % (len(value), value)
 
-    def sadd(self, key, *members):
+    def CMD_sadd(self, key, *members):
         set_ = self.dictionary.get(key, set())
         prev_size = len(set_)
         for member in members:
@@ -374,14 +379,14 @@ class RedisProtocol(asyncio.Protocol):
         self.dictionary[key] = set_
         return b":%d\r\n" % (len(set_) - prev_size,)
 
-    def hset(self, key, field, value):
+    def CMD_hset(self, key, field, value):
         hash_ = self.dictionary.get(key, {})
         ret = int(field in hash_)
         hash_[field] = value
         self.dictionary[key] = hash_
         return b":%d\r\n" % (ret,)
 
-    def spop(self, key):  # TODO add `count`
+    def CMD_spop(self, key):  # TODO add `count`
         try:
             set_ = self.dictionary[key]  # type: set
             elem = set_.pop()
@@ -389,17 +394,18 @@ class RedisProtocol(asyncio.Protocol):
             return b"$-1\r\n"
         return b"$%d\r\n%s\r\n" % (len(elem), elem)
 
-    def lrange(self, key, start, stop):
+    def CMD_lrange(self, key, start, stop):
         start = int(start)
         stop = int(stop)
+        print("->", start, stop)
         try:
             deque = self.dictionary[key]  # type: collections.deque
         except KeyError:
             return b"$-1\r\n"
         l = itertools.islice(deque, start, stop)
-        return b"*%d\r\n%s" % (stop - start, b"".join(b"$%d\r\n%s\r\n" % (len(e), e) for e in l))
+        return redis_encode(*list(l))
 
-    def mset(self, *args):
+    def CMD_mset(self, *args):
         for i in range(0, len(args), 2):
             key = args[i]
             value = args[i + 1]
@@ -428,7 +434,7 @@ def main(bind_ip, bind_port, name) -> int:
     loop.run_until_complete(server.start())
 
     # Serve requests until Ctrl+C is pressed
-    print('Serving on {}'.format(listener.sockets[0].getsockname()))
+    logger.info('Serving on {}'.format(listener.sockets[0].getsockname()))
     try:
         loop.run_forever()
     except KeyboardInterrupt:
