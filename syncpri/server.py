@@ -131,7 +131,7 @@ class Lock:
         self.waiting_nodes.append(ln)
         return ln
 
-    def move_next(self):
+    def _move_next(self):
         logger.debug("moving next %s", self.waiting_nodes)
         if not self.waiting_nodes:
             return
@@ -146,6 +146,12 @@ class Lock:
         ln.conn.transport.write(redis_encode(self.id))
         return ln
 
+    def move_next(self):
+        while True:
+            try:
+                return self._move_next()
+            except Exception as e:
+                logger.exception('exception on moving to next node')
 
 class RedisProtocol(asyncio.Protocol):
 
@@ -195,11 +201,22 @@ class RedisProtocol(asyncio.Protocol):
                 del self.server.locks[lock_name]
             return redis_encode(lock.id)
         else:
-            return b'-ERR lock doesnt exists (or not owner)'
+            return b'-ERR lock does not exist (or not owner)'
 
-    def CMD_node_list(self):
+    def identify(self):
+        return self.identifier or ':'.join([str(i) for i in self.transport.get_extra_info('peername')])
+
+    def CMD_node_list(self, lock_name):
         # TODO:
-        pass
+        lock: Lock = self.server.locks.get(lock_name)
+        if not lock:
+            return b'-ERR lock does not exist'
+        out = json.dumps({
+            'owner': lock.owner.identify(),
+            'waiting': [ln.conn.identify() for ln in lock.waiting_nodes]
+        })
+        print(out)
+        return redis_encode(out)
 
     def CMD_join(self, identifier):
         self.identifier = identifier
@@ -397,7 +414,6 @@ class RedisProtocol(asyncio.Protocol):
     def CMD_lrange(self, key, start, stop):
         start = int(start)
         stop = int(stop)
-        print("->", start, stop)
         try:
             deque = self.dictionary[key]  # type: collections.deque
         except KeyError:

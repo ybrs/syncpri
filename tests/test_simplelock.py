@@ -2,7 +2,7 @@ import subprocess
 import sys
 import os
 from threading import Thread
-
+import signal
 import pytest
 import pexpect
 import redis
@@ -12,6 +12,9 @@ from functools import partial
 import time
 
 from multiprocessing import Process
+
+from utils import with_server_in_background
+
 
 def proc(lock_name, x):
     print(lock_name)
@@ -39,37 +42,17 @@ def _test_server_running():
     rds = redis.Redis(port=7878)
     rds.ping()
 
-
-def spawn_server_bg(pipe):
-    proc = subprocess.Popen(["python", "./syncpri/server.py"],
-                            env=os.environ.copy(),
-                            stdout=subprocess.PIPE)
-
-    pipe.send([proc.pid])
-    while True:
-        out = proc.stdout.read(1)
-        if out == '' and proc.poll() != None:
-            break
-        if out != '':
-            try:
-                sys.stdout.write(out)
-            except:
-                pass
-            sys.stdout.flush()
-
+@with_server_in_background
 def test_lock_server():
-    parent_conn, child_conn = Pipe()
-    p = Process(target=spawn_server_bg, args=(child_conn,))
-    p.start()
-    time.sleep(1)
-    pid = parent_conn.recv()
-    print("pid", pid)
+    """
+    run 4 processes randomly, put locks so they'll
+    work sequentially
 
-    #
+    :return:
+    """
     rds = redis.Redis(port=7878)
-    print(rds.ping())
+    rds.ping()
     rds.delete('rtest')
-    print("delete")
     #
     pool = Pool(processes=5)
 
@@ -84,23 +67,20 @@ def test_lock_server():
         pool.apply_async(proc_4, (4,)),
         pool.apply_async(proc_3, (3,)),
     ]
-    print("sleep")
+
     time.sleep(1)
-    print("done")
+
     rds.execute_command('RELEASE', 'rtest1', lock1[0])
     rds.execute_command('RELEASE', 'rtest2', lock2[0])
     rds.execute_command('RELEASE', 'rtest3', lock3[0])
     rds.execute_command('RELEASE', 'rtest4', lock4[0])
-    print("released")
 
     for r in res:
         r.get(timeout=1)
     #
-    assert [1,2,3,4] == [int(i) for i in rds.lrange('rtest', 0, 100)]
+    assert [1, 2, 3, 4] == [int(i) for i in rds.lrange('rtest', 0, 100)]
 
-    import signal
-    os.kill(int(pid[0]), signal.SIGTERM)
-    p.kill()
+
 
 if __name__ == '__main__':
     test_lock_server()
